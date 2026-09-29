@@ -9,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <span>
@@ -279,6 +280,9 @@ public:
         MaterializationStopReason stop_reason = MaterializationStopReason::QueueExhausted;
         bool budget_exhausted                 = false;
         auto search_phase                     = MaterializationSearchPhase::Setup;
+        // LOCAL PATCH (maximal-fallback-rescue): see fallback_rescue_allowance().
+        const std::optional<PlanningAllowance> rescue =
+            identity_best ? std::nullopt : fallback_rescue_allowance(allowance);
         const auto allow_work = [&](std::uint64_t operation, std::uint64_t completion,
                                     std::uint64_t gain, bool complete,
                                     bool discovery_eligible = true) {
@@ -286,6 +290,13 @@ public:
                 stop_reason      = MaterializationStopReason::WorkBudget;
                 budget_exhausted = true;
                 return false;
+            }
+            if (rescue && incumbent.root_maximal &&
+                std::max<std::uint64_t>(1, operation) <=
+                    rescue->remaining(planning_now_ns<Clock>())) {
+                stop_reason      = MaterializationStopReason::QueueExhausted;
+                budget_exhausted = false;
+                return true;
             }
             if (!search_budget.allow(planning_now_ns<Clock>(), operation, completion, gain,
                                      complete, search_work, discovery_eligible)) {
@@ -1227,6 +1238,29 @@ private:
             .degradation_units = assessment.degradation_units,
             .root_maximal      = assessment.root_maximal,
         };
+    }
+
+    // LOCAL PATCH (maximal-fallback-rescue). When no candidate fits without pressure, the search
+    // is seeded with the root-maximal target, which evicts every private and shared owner,
+    // Host-resident ones included. The ordinary budget then stops on InsufficientExpectedGain
+    // after one ~5 ms renewal, so on long prompts the wipe is committed with zero improvements
+    // even though the 50 ms allowance is mostly unspent. While the incumbent is still that
+    // wipe, keep searching until this rescue window closes; the first cheaper feasible target
+    // ends the override and normal budgeting resumes. Cancellation and the request deadline
+    // still apply. NINFER_FALLBACK_RESCUE_MS=0 restores upstream behaviour.
+    [[nodiscard]] static std::optional<PlanningAllowance>
+    fallback_rescue_allowance(const PlanningAllowance& allowance) noexcept {
+        static const std::uint64_t window_ns = [] {
+            const char* value = std::getenv("NINFER_FALLBACK_RESCUE_MS");
+            char* end         = nullptr;
+            const unsigned long long ms =
+                value != nullptr && *value != '\0' ? std::strtoull(value, &end, 10) : 200ULL;
+            return (end != nullptr && *end != '\0') ? 200'000'000ULL : ms * 1'000'000ULL;
+        }();
+        if (window_ns == 0) { return std::nullopt; }
+        PlanningAllowance rescue = allowance;
+        rescue.limit_ns          = std::max(rescue.limit_ns, window_ns);
+        return rescue;
     }
 
     [[nodiscard]] static auto queue_key(const QueueEntry& entry) noexcept {
