@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <span>
@@ -660,7 +661,7 @@ public:
                 });
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
                     .owner                    = owner,
-                    .private_retention_weight = private_retention_weight(entry.retention),
+                    .private_retention_weight = recency_retention_weight(entry),
                 });
                 if (entry.summary.endpoint) {
                     append_private_checkpoint(owner, slot, *entry.summary.endpoint);
@@ -978,8 +979,9 @@ public:
         assign_continuation_summary(publication.summary, result.summary);
         publication.handle.emplace(std::move(*result.continuation));
         result.continuation.reset();
-        publication.session   = active.session;
-        publication.retention = active.retention;
+        publication.session     = active.session;
+        publication.retention   = active.retention;
+        publication.touch_epoch = ++touch_epoch_;
         migrate_observations(publication, result.summary, active.retention);
         advance_revision(publication.revision);
         if (publication.session && active.update_session_index) {
@@ -1161,6 +1163,8 @@ private:
         std::optional<CacheSessionKey> session;
         std::vector<CheckpointObservation> observations;
         RetentionClass retention = RetentionClass::RecentPrivate;
+        // LOCAL PATCH (recency-retention): order of the last publication or source reuse.
+        std::uint64_t touch_epoch = 0;
     };
 
     struct SharedCatalogEntry {
@@ -1433,6 +1437,35 @@ private:
         return 0;
     }
 
+    // LOCAL PATCH (recency-retention). Upstream prices every private owner at
+    // weight(class) x rebuild saving with no age term, and every Anthropic/Chat
+    // request is RecentPrivate, so under pressure the victim is simply the owner
+    // that is cheapest to rebuild: a live 60K conversation loses to a finished
+    // 150K one. Here only the `recent_private_keep_` most recently touched
+    // continuations keep their class weight; older ones are priced at 0 (no
+    // future loss), so they are evicted first but still hit while retained.
+    // NINFER_RECENT_PRIVATE_KEEP=0 restores upstream behaviour.
+    [[nodiscard]] std::uint32_t recency_retention_weight(const CatalogEntry& entry) const noexcept {
+        const std::uint32_t weight = private_retention_weight(entry.retention);
+        if (recent_private_keep_ == 0) { return weight; }
+        std::uint32_t newer = 0;
+        for (const CatalogEntry& other : catalog_) {
+            if (&other != &entry && other.handle && other.touch_epoch > entry.touch_epoch) {
+                ++newer;
+            }
+        }
+        return newer < recent_private_keep_ ? weight : 0;
+    }
+
+    [[nodiscard]] static std::uint32_t recent_private_keep_from_environment() noexcept {
+        const char* value = std::getenv("NINFER_RECENT_PRIVATE_KEEP");
+        if (value == nullptr || *value == '\0') { return 4; }
+        char* end                  = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        if (end == value || *end != '\0' || parsed > 1024) { return 4; }
+        return static_cast<std::uint32_t>(parsed);
+    }
+
     void require_lane(LaneId lane, LogicalLaneState expected) const {
         if (lane.value >= lane_count_ || lanes_[lane.value] != expected ||
             ((expected == LogicalLaneState::Active ||
@@ -1560,7 +1593,8 @@ private:
         entry.handle.reset();
         entry.session.reset();
         entry.observations.clear();
-        entry.retention = RetentionClass::RecentPrivate;
+        entry.retention   = RetentionClass::RecentPrivate;
+        entry.touch_epoch = 0;
         advance_revision(entry.revision);
     }
 
@@ -1735,7 +1769,7 @@ private:
             const PlanningOwnerId owner{.value = next_projected_owner++};
             projected_owners.push_back(ContextPortfolioOwnerPolicy{
                 .owner                    = owner,
-                .private_retention_weight = private_retention_weight(entry.retention),
+                .private_retention_weight = recency_retention_weight(entry),
             });
             if (entry.summary.endpoint) {
                 append_existing(owner, *entry.handle, *entry.summary.endpoint);
@@ -1924,7 +1958,7 @@ private:
                     .retention_class          = entry.retention,
                     .selected_hit_count       = selected_hits,
                     .last_hit_epoch           = newest_hit_epoch(entry),
-                    .private_retention_weight = private_retention_weight(entry.retention),
+                    .private_retention_weight = recency_retention_weight(entry),
                 });
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -2855,6 +2889,7 @@ private:
                                                    source.revision);
                 }
                 source.state            = CatalogState::Catalogued;
+                source.touch_epoch      = ++touch_epoch_;
                 retained_private_source = result.status == ContextTransactionStatus::Published;
             } else if (result.source->mode == PrivateSourceMode::ConsumeToActive) {
                 erase_session_if_owner(source.id);
@@ -3385,6 +3420,9 @@ private:
     std::uint64_t next_shared_prefix_id_ = 1;
     std::uint64_t retention_epoch_       = 0;
     std::uint64_t demand_epoch_          = 0;
+    // LOCAL PATCH (recency-retention).
+    std::uint64_t touch_epoch_         = 0;
+    std::uint32_t recent_private_keep_ = recent_private_keep_from_environment();
 };
 
 } // namespace ninfer::runtime
